@@ -195,7 +195,7 @@ if (isset($update['message'])) {
     switch ($text) {
         case '/start':
             if (!checkChannelMembership($chat_id, $user_id)) {
-                $keyboard = [[['text' => 'عضویت در کانال', 'url' => 't.me/JetApply']]];
+                $keyboard = [[['text' => 'عضویت در کانال', 'url' => 't.me/irnog']]];
                 sendMessage($chat_id, 
                     "سلام 👋\n" .
                     "به ربات احراز هویت و درخواست عضویت IRNOG خوش‌ آمدید! 🌟\n\n" .
