@@ -1,69 +1,116 @@
 <?php
 
+// بارگذاری تنظیمات از فایل .env
 if (file_exists('.env')) {
     include '.env'; 
 }
+
 
 define('BOT_TOKEN', getenv('BOT_TOKEN'));
 define('API_URL', 'https://api.telegram.org/bot' . BOT_TOKEN . '/');
 define('CHANNEL_ID', getenv('CHANNEL_ID'));
 define('ADMIN_ID', getenv('ADMIN_ID'));
-define('USERS_FILE', getenv('USERS_FILE') ?: 'users.json');
+define('DB_PATH', getenv('DB_PATH') ?: 'bot_database.sqlite');
 define('GROUP_LINK', getenv('GROUP_LINK'));
 
+// اتصال به دیتابیس و ایجاد جداول
+function initDatabase() {
+    $pdo = new PDO('sqlite:' . DB_PATH);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    
+    // ایجاد جدول کاربران
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            state TEXT,
+            name TEXT,
+            company TEXT,
+            expertise TEXT,
+            email TEXT,
+            motivation TEXT,
+            verification_type TEXT,
+            verification_value TEXT,
+            verification_ref_name TEXT,
+            status TEXT DEFAULT 'در انتظار بررسی',
+            rejection_reason TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ");
+    
+    return $pdo;
+}
 
-function loadUsersData() {
-    if (!file_exists(USERS_FILE)) {
-        file_put_contents(USERS_FILE, json_encode([]));
-        return [];
+// دریافت اتصال دیتابیس
+function getDatabase() {
+    static $pdo = null;
+    if ($pdo === null) {
+        $pdo = initDatabase();
     }
-    return json_decode(file_get_contents(USERS_FILE), true) ?? [];
+    return $pdo;
 }
 
-function saveUsersData($data) {
-    file_put_contents(USERS_FILE, json_encode($data, JSON_PRETTY_PRINT));
-}
-
+// توابع کار با کاربران
 function getUserState($chat_id) {
-    $users = loadUsersData();
-    return $users[$chat_id]['state'] ?? null;
+    $pdo = getDatabase();
+    $stmt = $pdo->prepare("SELECT state FROM users WHERE chat_id = ?");
+    $stmt->execute([$chat_id]);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $result ? $result['state'] : null;
 }
 
 function setUserState($chat_id, $state) {
-    $users = loadUsersData();
-    if (!isset($users[$chat_id])) {
-        $users[$chat_id] = ['state' => $state, 'data' => []];
-    } else {
-        $users[$chat_id]['state'] = $state;
-    }
-    saveUsersData($users);
+    $pdo = getDatabase();
+    $stmt = $pdo->prepare("
+        INSERT OR REPLACE INTO users (chat_id, state, updated_at) 
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+    ");
+    $stmt->execute([$chat_id, $state]);
 }
 
 function saveUserData($chat_id, $field, $value) {
-    $users = loadUsersData();
-    if (!isset($users[$chat_id])) {
-        $users[$chat_id] = ['state' => null, 'data' => []];
+    $pdo = getDatabase();
+    
+    // بررسی وجود کاربر
+    $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
+    $stmt->execute([$chat_id]);
+    
+    if (!$stmt->fetch()) {
+        // ایجاد کاربر جدید
+        $stmt = $pdo->prepare("INSERT INTO users (chat_id) VALUES (?)");
+        $stmt->execute([$chat_id]);
     }
-    $users[$chat_id]['data'][$field] = $value;
-    saveUsersData($users);
+    
+    // بروزرسانی فیلد مورد نظر
+    $stmt = $pdo->prepare("UPDATE users SET $field = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?");
+    $stmt->execute([$value, $chat_id]);
 }
 
 function getUserData($chat_id, $field = null) {
-    $users = loadUsersData();
-    if (!isset($users[$chat_id])) {
+    $pdo = getDatabase();
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE chat_id = ?");
+    $stmt->execute([$chat_id]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$user) {
         return null;
     }
     
     if ($field === null) {
-        return $users[$chat_id]['data'] ?? null;
+        return $user;
     }
     
-    return $users[$chat_id]['data'][$field] ?? null;
+    return $user[$field] ?? null;
 }
 
-function getUserByTelegramId($chat_id) {
-    $users = loadUsersData();
-    return $users[$chat_id] ?? null;
+function saveVerificationData($chat_id, $type, $value, $ref_name = null) {
+    $pdo = getDatabase();
+    $stmt = $pdo->prepare("
+        UPDATE users 
+        SET verification_type = ?, verification_value = ?, verification_ref_name = ?, updated_at = CURRENT_TIMESTAMP 
+        WHERE chat_id = ?
+    ");
+    $stmt->execute([$type, $value, $ref_name, $chat_id]);
 }
 
 // توابع ارتباط با API تلگرام
@@ -125,8 +172,6 @@ function isValidLinkedInUrl($url) {
     return isValidUrl($url) && strpos($url, 'linkedin.com') !== false;
 }
 
-
-
 function showUserProfile($chat_id) {
     $userData = getUserData($chat_id);
     
@@ -142,13 +187,13 @@ function showUserProfile($chat_id) {
                    "📧 <b>ایمیل:</b> {$userData['email']}\n\n" .
                    "📋 <b>انگیزه‌نامه:</b>\n{$userData['motivation']}\n\n";
 
-    if (isset($userData['verification'])) {
-        if ($userData['verification']['type'] === 'linkedin') {
-            $profileText .= "🔗 <b>لینک LinkedIn:</b>\n{$userData['verification']['value']}\n";
-        } elseif ($userData['verification']['type'] === 'resume') {
-            $profileText .= "📄 <b>لینک رزومه:</b>\n{$userData['verification']['value']}\n";
-        } elseif ($userData['verification']['type'] === 'referral') {
-            $profileText .= "👥 <b>معرف:</b>\n{$userData['verification']['ref_name']} ({$userData['verification']['value']})\n";
+    if ($userData['verification_type']) {
+        if ($userData['verification_type'] === 'linkedin') {
+            $profileText .= "🔗 <b>لینک LinkedIn:</b>\n{$userData['verification_value']}\n";
+        } elseif ($userData['verification_type'] === 'resume') {
+            $profileText .= "📄 <b>لینک رزومه:</b>\n{$userData['verification_value']}\n";
+        } elseif ($userData['verification_type'] === 'referral') {
+            $profileText .= "👥 <b>معرف:</b>\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
         }
     }
     
@@ -156,7 +201,7 @@ function showUserProfile($chat_id) {
     $profileText .= "\n🔍 <b>وضعیت درخواست:</b> {$status}";
     
     // اگر درخواست رد شده و دلیلی برای آن ثبت شده باشد
-    if ($status === 'رد شده' && isset($userData['rejection_reason'])) {
+    if ($status === 'رد شده' && $userData['rejection_reason']) {
         $profileText .= "\n<b>دلیل رد درخواست:</b> {$userData['rejection_reason']}";
     }
     
@@ -181,7 +226,7 @@ if (isset($update['message'])) {
     $user_id = $message['from']['id'];
     
     // بررسی که آیا کاربر قبلا ثبت‌نام کرده است
-    $existingUser = getUserByTelegramId($chat_id);
+    $existingUser = getUserData($chat_id);
     $user_state = getUserState($chat_id);
     
     // بررسی وضعیت انتظار برای دلیل رد درخواست
@@ -206,8 +251,8 @@ if (isset($update['message'])) {
             }
             
             // بررسی اینکه آیا کاربر قبلا ثبت‌نام کرده است
-            if ($existingUser && isset($existingUser['data']['name'])) {
-                $name = $existingUser['data']['name'];
+            if ($existingUser && $existingUser['name']) {
+                $name = $existingUser['name'];
                 sendMessage($chat_id, "سلام {$name} عزیز 👋\n\nخوش‌آمدید. از منوی زیر می‌توانید گزینه مورد نظر خود را انتخاب کنید:", [
                     [['text' => 'مشاهده پروفایل', 'callback_data' => 'view_profile']],
                     [['text' => 'ویرایش پروفایل', 'callback_data' => 'edit_profile']],
@@ -268,7 +313,7 @@ if (isset($update['message'])) {
                         return;
                     }
                     
-                    saveUserData($chat_id, 'verification', ['type' => 'linkedin', 'value' => $text]);
+                    saveVerificationData($chat_id, 'linkedin', $text);
                     finalizeRegistration($chat_id);
                     break;
                     
@@ -278,25 +323,18 @@ if (isset($update['message'])) {
                         return;
                     }
                     
-                    saveUserData($chat_id, 'verification', ['type' => 'resume', 'value' => $text]);
+                    saveVerificationData($chat_id, 'resume', $text);
                     finalizeRegistration($chat_id);
                     break;
                     
                 case 'AWAIT_REFERRAL_NAME':
-                    saveUserData($chat_id, 'verification', [
-                        'type' => 'referral', 
-                        'value' => '',  // خالی یا یک مقدار پیش‌فرض
-                        'ref_name' => $text
-                    ]);
+                    saveVerificationData($chat_id, 'referral', '', $text);
                     finalizeRegistration($chat_id);
                     break;
                 
                 case 'AWAIT_REFERRAL_ID':
-                    saveUserData($chat_id, 'verification', [
-                        'type' => 'referral', 
-                        'value' => $text,
-                        'ref_name' => getUserData($chat_id, 'referral_name')
-                    ]);
+                    $refName = getUserData($chat_id, 'verification_ref_name');
+                    saveVerificationData($chat_id, 'referral', $text, $refName);
                     finalizeRegistration($chat_id);
                     break;
                     
@@ -438,15 +476,7 @@ if (isset($update['callback_query'])) {
             }
             
             saveUserData($chat_id, 'status', 'در انتظار بررسی');
-            // پاک کردن دلیل رد درخواست قبلی (اگر وجود داشته باشد)
-            $userData = getUserData($chat_id);
-            if (isset($userData['rejection_reason'])) {
-                $userData = getUserData($chat_id);
-                unset($userData['rejection_reason']);
-                $users = loadUsersData();
-                $users[$chat_id]['data'] = $userData;
-                saveUsersData($users);
-            }
+            saveUserData($chat_id, 'rejection_reason', null);
             
             // آماده‌سازی پیام برای ادمین
             $adminMessage = "📝 درخواست عضویت مجدد:\n\n" .
@@ -456,12 +486,12 @@ if (isset($update['callback_query'])) {
                            "📧 ایمیل: {$userData['email']}\n\n" .
                            "📋 انگیزه‌نامه:\n{$userData['motivation']}\n\n";
 
-            if ($userData['verification']['type'] === 'linkedin') {
-                $adminMessage .= "🔗 لینک LinkedIn:\n{$userData['verification']['value']}\n";
-            } elseif ($userData['verification']['type'] === 'resume') {
-                $adminMessage .= "📄 لینک رزومه:\n{$userData['verification']['value']}\n";
-            } elseif ($userData['verification']['type'] === 'referral') {
-                $adminMessage .= "👥 معرف:\n{$userData['verification']['ref_name']} ({$userData['verification']['value']})\n";
+            if ($userData['verification_type'] === 'linkedin') {
+                $adminMessage .= "🔗 لینک LinkedIn:\n{$userData['verification_value']}\n";
+            } elseif ($userData['verification_type'] === 'resume') {
+                $adminMessage .= "📄 لینک رزومه:\n{$userData['verification_value']}\n";
+            } elseif ($userData['verification_type'] === 'referral') {
+                $adminMessage .= "👥 معرف:\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
             }
             
             // اضافه کردن دکمه‌های تایید و رد برای ادمین
@@ -471,11 +501,6 @@ if (isset($update['callback_query'])) {
                     ['text' => '❌ رد درخواست', 'callback_data' => 'reject_reason_' . $chat_id]
                 ]
             ];
-            
-            // ثبت لاگ دکمه‌ها برای دیباگ
-            file_put_contents('keyboard_debug.txt', 
-                date('Y-m-d H:i:s') . ': approve=' . 'approve_' . $chat_id . 
-                ', reject=' . 'reject_reason_' . $chat_id . "\n", FILE_APPEND);
             
             // ارسال به ادمین
             sendMessage(ADMIN_ID, $adminMessage, $keyboard);
@@ -490,7 +515,7 @@ function finalizeRegistration($chat_id) {
     saveUserData($chat_id, 'status', 'در انتظار بررسی');
     
     // دریافت اطلاعات کاربر
-    $userData = loadUsersData()[$chat_id]['data'];
+    $userData = getUserData($chat_id);
     
     // آماده‌سازی پیام برای ادمین
     $adminMessage = "📝 درخواست عضویت جدید:\n\n" .
@@ -500,12 +525,12 @@ function finalizeRegistration($chat_id) {
                    "📧 ایمیل: {$userData['email']}\n\n" .
                    "📋 انگیزه‌نامه:\n{$userData['motivation']}\n\n";
 
-    if ($userData['verification']['type'] === 'linkedin') {
-        $adminMessage .= "🔗 لینک LinkedIn:\n{$userData['verification']['value']}\n";
-    } elseif ($userData['verification']['type'] === 'resume') {
-        $adminMessage .= "📄 لینک رزومه:\n{$userData['verification']['value']}\n";
-    } elseif ($userData['verification']['type'] === 'referral') {
-        $adminMessage .= "👥 معرف:\n{$userData['verification']['ref_name']} ({$userData['verification']['value']})\n";
+    if ($userData['verification_type'] === 'linkedin') {
+        $adminMessage .= "🔗 لینک LinkedIn:\n{$userData['verification_value']}\n";
+    } elseif ($userData['verification_type'] === 'resume') {
+        $adminMessage .= "📄 لینک رزومه:\n{$userData['verification_value']}\n";
+    } elseif ($userData['verification_type'] === 'referral') {
+        $adminMessage .= "👥 معرف:\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
     }
     
     // اضافه کردن دکمه‌های تایید و رد برای ادمین
@@ -516,12 +541,7 @@ function finalizeRegistration($chat_id) {
         ]
     ];
     
-    // ثبت لاگ دکمه‌ها برای دیباگ
-    file_put_contents('keyboard_debug.txt', 
-        date('Y-m-d H:i:s') . ': approve=' . 'approve_' . $chat_id . 
-        ', reject_reason=' . 'reject_reason_' . $chat_id . "\n", FILE_APPEND);
-    
-    // ارسال به ادمین با آیدی عددی
+    // ارسال به ادمین
     $adminResult = sendMessage(ADMIN_ID, $adminMessage, $keyboard);
     
     // لاگ نتیجه ارسال برای دیباگ
@@ -559,19 +579,11 @@ function handleApplicationResponse($action, $user_id, $admin_chat_id, $message_i
     $name = $userData['name'];
     
     if ($isApproved) {
-        // تایید درخواست
+        // Approve request
         saveUserData($user_id, 'status', 'تایید شده');
-        // پاک کردن دلیل رد درخواست قبلی (اگر وجود داشته باشد)
-        $userData = getUserData($user_id);
-        if (isset($userData['rejection_reason'])) {
-            $userData = getUserData($user_id);
-            unset($userData['rejection_reason']);
-            $users = loadUsersData();
-            $users[$user_id]['data'] = $userData;
-            saveUsersData($users);
-        }
+        saveUserData($user_id, 'rejection_reason', null);
         
-        // ارسال پیام به کاربر
+        // Send message to user
         $userMessage = "🎉 <b>تبریک!</b>\n\n" .
                       "درخواست عضویت شما در IRNOG تایید شد.\n\n" .
                       "برای ورود به گروه اصلی می‌توانید از لینک زیر استفاده کنید:\n" .
@@ -580,7 +592,7 @@ function handleApplicationResponse($action, $user_id, $admin_chat_id, $message_i
         $keyboardUser = [[['text' => 'ورود به گروه', 'url' => GROUP_LINK]]];
         sendMessage($user_id, $userMessage, $keyboardUser);
         
-        // بروزرسانی پیام ادمین یا ارسال پیام جدید
+        // Update admin message or send new message
         $adminMessage = "✅ درخواست عضویت {$name} تایید شد و لینک گروه برای ایشان ارسال گردید.";
         
         if ($message_id) {
@@ -589,19 +601,19 @@ function handleApplicationResponse($action, $user_id, $admin_chat_id, $message_i
             sendMessage($admin_chat_id, $adminMessage);
         }
     } else {
-        // رد درخواست
+        // Reject request
         saveUserData($user_id, 'status', 'رد شده');
         
-        // ذخیره دلیل رد درخواست اگر وارد شده باشد
+        // Save rejection reason if provided
         if ($reason) {
             saveUserData($user_id, 'rejection_reason', $reason);
         }
         
-        // ارسال پیام به کاربر
+        // Send message to user
         $userMessage = "❌ <b>اطلاعیه</b>\n\n" .
                       "متأسفانه درخواست عضویت شما در IRNOG در این مرحله تایید نشد.";
         
-        // اضافه کردن دلیل رد درخواست اگر وارد شده باشد
+        // Add rejection reason if provided
         if ($reason) {
             $userMessage .= "\n\n<b>دلیل:</b> {$reason}";
         }
@@ -610,7 +622,7 @@ function handleApplicationResponse($action, $user_id, $admin_chat_id, $message_i
         
         sendMessage($user_id, $userMessage);
         
-        // بروزرسانی پیام ادمین یا ارسال پیام جدید
+        // Update admin message or send new message
         $adminMessage = "❌ درخواست عضویت {$name} رد شد و به کاربر اطلاع داده شد.";
         
         if ($reason) {
@@ -624,7 +636,7 @@ function handleApplicationResponse($action, $user_id, $admin_chat_id, $message_i
         }
     }
     
-    // لاگ برای دیباگ
+    // Log for debugging
     $logEntry = date('Y-m-d H:i:s') . ': درخواست ' . $user_id . ' (' . $name . ') ' . 
                ($isApproved ? 'تایید' : 'رد');
     
@@ -635,5 +647,5 @@ function handleApplicationResponse($action, $user_id, $admin_chat_id, $message_i
     $logEntry .= "\n";
     file_put_contents('admin_actions_log.txt', $logEntry, FILE_APPEND);
     
-    return true; 
+    return true;
 }
