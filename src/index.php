@@ -73,18 +73,18 @@ function setUserState($chat_id, $state) {
 function saveUserData($chat_id, $field, $value) {
     $pdo = getDatabase();
     
-    // بررسی وجود کاربر
+    
     $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
     $stmt->execute([$chat_id]);
     
     if (!$stmt->fetch()) {
-        // ایجاد کاربر جدید
-        $stmt = $pdo->prepare("INSERT INTO users (chat_id) VALUES (?)");
+        
+        $stmt = $pdo->prepare("INSERT INTO users (chat_id, state) VALUES (?, 'AWAIT_NAME')");
         $stmt->execute([$chat_id]);
     }
     
-    // بروزرسانی فیلد مورد نظر
-    $stmt = $pdo->prepare("UPDATE users SET $field = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?");
+    
+    $stmt = $pdo->prepare("UPDATE users SET {$field} = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?");
     $stmt->execute([$value, $chat_id]);
 }
 
@@ -758,3 +758,4 @@ function handleApplicationResponse($action, $user_id, $reviewer_chat_id, $messag
     
     return true;
 }
+
