@@ -73,19 +73,45 @@ function setUserState($chat_id, $state) {
 function saveUserData($chat_id, $field, $value) {
     $pdo = getDatabase();
     
+  
+    $allowed_fields = ['name', 'company', 'expertise', 'email', 'motivation', 
+                       'verification_type', 'verification_value', 'verification_ref_name', 
+                       'status', 'rejection_reason', 'reviewed_by_user_id', 
+                       'reviewed_by_username', 'review_decision', 'state'];
     
-    $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
-    $stmt->execute([$chat_id]);
-    
-    if (!$stmt->fetch()) {
-        
-        $stmt = $pdo->prepare("INSERT INTO users (chat_id, state) VALUES (?, 'AWAIT_NAME')");
-        $stmt->execute([$chat_id]);
+    if (!in_array($field, $allowed_fields)) {
+        file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": Invalid field={$field}\n", FILE_APPEND);
+        return false;
     }
     
-    
-    $stmt = $pdo->prepare("UPDATE users SET {$field} = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?");
-    $stmt->execute([$value, $chat_id]);
+    try {
+        
+        $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
+        $stmt->execute([$chat_id]);
+        $exists = $stmt->fetch();
+        
+        if (!$exists) {
+            
+            $stmt = $pdo->prepare("INSERT INTO users (chat_id, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            $stmt->execute([$chat_id]);
+            file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": Created new user chat_id={$chat_id}\n", FILE_APPEND);
+        }
+        
+        
+        $sql = "UPDATE users SET {$field} = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?";
+        $stmt = $pdo->prepare($sql);
+        $result = $stmt->execute([$value, $chat_id]);
+        
+        
+        file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": Saved field={$field}, value={$value}, chat_id={$chat_id}, result=" . ($result ? 'success' : 'failed') . "\n", FILE_APPEND);
+        
+        return $result;
+        
+    } catch (PDOException $e) {
+        
+        file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": ERROR - {$e->getMessage()}\n", FILE_APPEND);
+        return false;
+    }
 }
 
 function getUserData($chat_id, $field = null) {
@@ -758,4 +784,5 @@ function handleApplicationResponse($action, $user_id, $reviewer_chat_id, $messag
     
     return true;
 }
+
 
