@@ -133,12 +133,38 @@ function getUserData($chat_id, $field = null) {
 
 function saveVerificationData($chat_id, $type, $value, $ref_name = null) {
     $pdo = getDatabase();
+    
+    // ابتدا بررسی کنیم که آیا رکورد کاربر وجود دارد
+    $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
+    $stmt->execute([$chat_id]);
+    $exists = $stmt->fetch();
+    
+    // اگر کاربر وجود نداشت، ابتدا یک رکورد می‌سازیم
+    if (!$exists) {
+        $stmt = $pdo->prepare("INSERT INTO users (chat_id, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+        $stmt->execute([$chat_id]);
+    }
+    
+    // حالا می‌توانیم به‌روزرسانی کنیم
     $stmt = $pdo->prepare("
         UPDATE users 
-        SET verification_type = ?, verification_value = ?, verification_ref_name = ?, updated_at = CURRENT_TIMESTAMP 
+        SET verification_type = ?, 
+            verification_value = ?, 
+            verification_ref_name = ?, 
+            updated_at = CURRENT_TIMESTAMP 
         WHERE chat_id = ?
     ");
-    $stmt->execute([$type, $value, $ref_name, $chat_id]);
+    
+    $result = $stmt->execute([$type, $value, $ref_name, $chat_id]);
+    
+    // لاگ برای دیباگ
+    file_put_contents('verification_log.txt', 
+        date('Y-m-d H:i:s') . ": Saved verification - chat_id={$chat_id}, type={$type}, value={$value}, ref_name={$ref_name}, result=" . 
+        ($result ? 'success' : 'failed') . "\n", 
+        FILE_APPEND
+    );
+    
+    return $result;
 }
 
 // توابع ارتباط با API تلگرام
@@ -378,11 +404,14 @@ if (isset($update['message'])) {
                     break;
                     
                 case 'AWAIT_REFERRAL_NAME':
-                    saveVerificationData($chat_id, 'referral', '', $text);
-                    finalizeRegistration($chat_id);
+                    // فقط نام معرف را ذخیره می‌کنیم و منتظر ID می‌مانیم
+                    saveUserData($chat_id, 'verification_ref_name', $text);
+                    setUserState($chat_id, 'AWAIT_REFERRAL_ID');
+                    sendMessage($chat_id, "لطفاً آیدی تلگرام یا شماره تماس عضو معرف را وارد کنید:");
                     break;
                 
                 case 'AWAIT_REFERRAL_ID':
+                    // حالا هم نام و هم ID داریم، پس ذخیره می‌کنیم
                     $refName = getUserData($chat_id, 'verification_ref_name');
                     saveVerificationData($chat_id, 'referral', $text, $refName);
                     finalizeRegistration($chat_id);
@@ -784,5 +813,3 @@ function handleApplicationResponse($action, $user_id, $reviewer_chat_id, $messag
     
     return true;
 }
-
-
