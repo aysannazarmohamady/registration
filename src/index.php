@@ -1,173 +1,217 @@
 <?php
 
-// بارگذاری تنظیمات از فایل .env
+// Load settings from .env file
 if (file_exists('.env')) {
-    include '.env'; 
+    $lines = file('.env', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        if (strpos(trim($line), '#') === 0) continue;
+        if (strpos($line, '=') === false) continue;
+        list($key, $value) = explode('=', $line, 2);
+        putenv(trim($key) . '=' . trim($value));
+    }
 }
 
 define('BOT_TOKEN', getenv('BOT_TOKEN'));
 define('API_URL', 'https://api.telegram.org/bot' . BOT_TOKEN . '/');
 define('CHANNEL_ID', getenv('CHANNEL_ID'));
-define('REVIEW_GROUP_ID', getenv('REVIEW_GROUP_ID')); // تغییر از ADMIN_ID به REVIEW_GROUP_ID
-define('DB_PATH', getenv('DB_PATH') ?: 'bot_database.sqlite');
-define('GROUP_LINK', getenv('GROUP_LINK'));
+define('REVIEW_GROUP_ID', getenv('REVIEW_GROUP_ID'));
+define('DB_PATH', getenv('DB_PATH'));
+define('GROUP_LINK', getenv('GROUP_LINK')); // Main group chat ID for creating invite links
+define('MAIN_GROUP_ID', getenv('MAIN_GROUP_ID')); // Chat ID of the main group
 
-// اتصال به دیتابیس و ایجاد جداول
-function initDatabase() {
-    $pdo = new PDO('sqlite:' . DB_PATH);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    
-    // ایجاد جدول کاربران
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            state TEXT,
-            name TEXT,
-            company TEXT,
-            expertise TEXT,
-            email TEXT,
-            motivation TEXT,
-            verification_type TEXT,
-            verification_value TEXT,
-            verification_ref_name TEXT,
-            status TEXT DEFAULT 'در انتظار بررسی',
-            rejection_reason TEXT,
-            reviewed_by_user_id TEXT,
-            reviewed_by_username TEXT,
-            review_decision TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ");
-    
-    return $pdo;
-}
-
-// دریافت اتصال دیتابیس
+// Connect to database and create tables
 function getDatabase() {
     static $pdo = null;
+    
     if ($pdo === null) {
-        $pdo = initDatabase();
+        try {
+            // Check and create directory if needed
+            $dbDir = dirname(DB_PATH);
+            if (!is_dir($dbDir)) {
+                mkdir($dbDir, 0755, true);
+            }
+            
+            // Check directory permissions
+            if (!is_writable($dbDir)) {
+                chmod($dbDir, 0755);
+            }
+            
+            $pdo = new PDO('sqlite:' . DB_PATH);
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            
+            // SQLite optimization settings
+            $pdo->exec('PRAGMA journal_mode = WAL');
+            $pdo->exec('PRAGMA synchronous = NORMAL');
+            
+            // Create users table
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER PRIMARY KEY,
+                    state TEXT,
+                    name TEXT,
+                    company TEXT,
+                    expertise TEXT,
+                    email TEXT,
+                    motivation TEXT,
+                    verification_type TEXT,
+                    verification_value TEXT,
+                    verification_ref_name TEXT,
+                    status TEXT DEFAULT 'در انتظار بررسی',
+                    rejection_reason TEXT,
+                    reviewed_by_user_id TEXT,
+                    reviewed_by_username TEXT,
+                    review_decision TEXT,
+                    invite_link TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ");
+            
+            // Set database file permissions
+            if (file_exists(DB_PATH)) {
+                chmod(DB_PATH, 0666);
+            }
+            
+        } catch (PDOException $e) {
+            file_put_contents('db_error.log', date('Y-m-d H:i:s') . ': ' . $e->getMessage() . "\n", FILE_APPEND);
+            die('Database connection failed');
+        }
     }
+    
     return $pdo;
 }
 
-// توابع کار با کاربران
+// User functions
 function getUserState($chat_id) {
-    $pdo = getDatabase();
-    $stmt = $pdo->prepare("SELECT state FROM users WHERE chat_id = ?");
-    $stmt->execute([$chat_id]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-    return $result ? $result['state'] : null;
+    try {
+        $pdo = getDatabase();
+        $stmt = $pdo->prepare("SELECT state FROM users WHERE chat_id = ?");
+        $stmt->execute([$chat_id]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $result ? $result['state'] : null;
+    } catch (PDOException $e) {
+        file_put_contents('db_error.log', date('Y-m-d H:i:s') . ': getUserState error: ' . $e->getMessage() . "\n", FILE_APPEND);
+        return null;
+    }
 }
 
 function setUserState($chat_id, $state) {
-    $pdo = getDatabase();
-    $stmt = $pdo->prepare("
-        INSERT OR REPLACE INTO users (chat_id, state, updated_at) 
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-    ");
-    $stmt->execute([$chat_id, $state]);
+    try {
+        $pdo = getDatabase();
+        
+        // Check if user exists
+        $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
+        $stmt->execute([$chat_id]);
+        $exists = $stmt->fetch();
+        
+        if ($exists) {
+            $stmt = $pdo->prepare("UPDATE users SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?");
+            $stmt->execute([$state, $chat_id]);
+        } else {
+            $stmt = $pdo->prepare("INSERT INTO users (chat_id, state, created_at, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            $stmt->execute([$chat_id, $state]);
+        }
+        
+        return true;
+    } catch (PDOException $e) {
+        file_put_contents('db_error.log', date('Y-m-d H:i:s') . ': setUserState error: ' . $e->getMessage() . "\n", FILE_APPEND);
+        return false;
+    }
 }
 
 function saveUserData($chat_id, $field, $value) {
-    $pdo = getDatabase();
-    
-  
     $allowed_fields = ['name', 'company', 'expertise', 'email', 'motivation', 
                        'verification_type', 'verification_value', 'verification_ref_name', 
                        'status', 'rejection_reason', 'reviewed_by_user_id', 
-                       'reviewed_by_username', 'review_decision', 'state'];
+                       'reviewed_by_username', 'review_decision', 'state', 'invite_link'];
     
     if (!in_array($field, $allowed_fields)) {
-        file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": Invalid field={$field}\n", FILE_APPEND);
         return false;
     }
     
     try {
+        $pdo = getDatabase();
         
+        // Check if user exists
         $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
         $stmt->execute([$chat_id]);
         $exists = $stmt->fetch();
         
         if (!$exists) {
-            
             $stmt = $pdo->prepare("INSERT INTO users (chat_id, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
             $stmt->execute([$chat_id]);
-            file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": Created new user chat_id={$chat_id}\n", FILE_APPEND);
         }
         
-        
+        // Update field
         $sql = "UPDATE users SET {$field} = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?";
         $stmt = $pdo->prepare($sql);
         $result = $stmt->execute([$value, $chat_id]);
         
-        
-        file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": Saved field={$field}, value={$value}, chat_id={$chat_id}, result=" . ($result ? 'success' : 'failed') . "\n", FILE_APPEND);
-        
         return $result;
         
     } catch (PDOException $e) {
-        
-        file_put_contents('save_data_log.txt', date('Y-m-d H:i:s') . ": ERROR - {$e->getMessage()}\n", FILE_APPEND);
+        file_put_contents('db_error.log', date('Y-m-d H:i:s') . ': saveUserData error: ' . $e->getMessage() . "\n", FILE_APPEND);
         return false;
     }
 }
 
 function getUserData($chat_id, $field = null) {
-    $pdo = getDatabase();
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE chat_id = ?");
-    $stmt->execute([$chat_id]);
-    $user = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$user) {
+    try {
+        $pdo = getDatabase();
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE chat_id = ?");
+        $stmt->execute([$chat_id]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$user) {
+            return null;
+        }
+        
+        if ($field === null) {
+            return $user;
+        }
+        
+        return $user[$field] ?? null;
+    } catch (PDOException $e) {
+        file_put_contents('db_error.log', date('Y-m-d H:i:s') . ': getUserData error: ' . $e->getMessage() . "\n", FILE_APPEND);
         return null;
     }
-    
-    if ($field === null) {
-        return $user;
-    }
-    
-    return $user[$field] ?? null;
 }
 
 function saveVerificationData($chat_id, $type, $value, $ref_name = null) {
-    $pdo = getDatabase();
-    
-    // ابتدا بررسی کنیم که آیا رکورد کاربر وجود دارد
-    $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
-    $stmt->execute([$chat_id]);
-    $exists = $stmt->fetch();
-    
-    // اگر کاربر وجود نداشت، ابتدا یک رکورد می‌سازیم
-    if (!$exists) {
-        $stmt = $pdo->prepare("INSERT INTO users (chat_id, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+    try {
+        $pdo = getDatabase();
+        
+        // Check if user exists
+        $stmt = $pdo->prepare("SELECT chat_id FROM users WHERE chat_id = ?");
         $stmt->execute([$chat_id]);
+        $exists = $stmt->fetch();
+        
+        if (!$exists) {
+            $stmt = $pdo->prepare("INSERT INTO users (chat_id, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            $stmt->execute([$chat_id]);
+        }
+        
+        // Update verification data
+        $stmt = $pdo->prepare("
+            UPDATE users 
+            SET verification_type = ?, 
+                verification_value = ?, 
+                verification_ref_name = ?, 
+                updated_at = CURRENT_TIMESTAMP 
+            WHERE chat_id = ?
+        ");
+        
+        $result = $stmt->execute([$type, $value, $ref_name, $chat_id]);
+        
+        return $result;
+        
+    } catch (PDOException $e) {
+        file_put_contents('db_error.log', date('Y-m-d H:i:s') . ': saveVerificationData error: ' . $e->getMessage() . "\n", FILE_APPEND);
+        return false;
     }
-    
-    // حالا می‌توانیم به‌روزرسانی کنیم
-    $stmt = $pdo->prepare("
-        UPDATE users 
-        SET verification_type = ?, 
-            verification_value = ?, 
-            verification_ref_name = ?, 
-            updated_at = CURRENT_TIMESTAMP 
-        WHERE chat_id = ?
-    ");
-    
-    $result = $stmt->execute([$type, $value, $ref_name, $chat_id]);
-    
-    // لاگ برای دیباگ
-    file_put_contents('verification_log.txt', 
-        date('Y-m-d H:i:s') . ": Saved verification - chat_id={$chat_id}, type={$type}, value={$value}, ref_name={$ref_name}, result=" . 
-        ($result ? 'success' : 'failed') . "\n", 
-        FILE_APPEND
-    );
-    
-    return $result;
 }
 
-// توابع ارتباط با API تلگرام
+// Telegram API functions
 function makeHTTPRequest($method, $params = []) {
     $url = API_URL . $method;
     $ch = curl_init();
@@ -179,7 +223,7 @@ function makeHTTPRequest($method, $params = []) {
     return json_decode($result, true);
 }
 
-function sendMessage($chat_id, $text, $keyboard = null) {
+function sendMessage($chat_id, $text, $keyboard = null, $silent = false) {
     $params = [
         'chat_id' => $chat_id,
         'text' => $text,
@@ -188,6 +232,10 @@ function sendMessage($chat_id, $text, $keyboard = null) {
     
     if ($keyboard !== null) {
         $params['reply_markup'] = json_encode(['inline_keyboard' => $keyboard]);
+    }
+    
+    if ($silent) {
+        $params['disable_notification'] = true;
     }
     
     return makeHTTPRequest('sendMessage', $params);
@@ -208,6 +256,20 @@ function editMessageText($chat_id, $message_id, $text, $keyboard = null) {
     return makeHTTPRequest('editMessageText', $params);
 }
 
+function createOneTimeInviteLink($user_id, $user_name) {
+    $result = makeHTTPRequest('createChatInviteLink', [
+        'chat_id' => MAIN_GROUP_ID,
+        'member_limit' => 1,
+        'name' => "Invite for {$user_name} (ID: {$user_id})"
+    ]);
+    
+    if (isset($result['result']['invite_link'])) {
+        return $result['result']['invite_link'];
+    }
+    
+    return null;
+}
+
 function checkChannelMembership($chat_id, $user_id) {
     $result = makeHTTPRequest('getChatMember', [
         'chat_id' => CHANNEL_ID,
@@ -218,7 +280,6 @@ function checkChannelMembership($chat_id, $user_id) {
            in_array($result['result']['status'], ['member', 'administrator', 'creator']);
 }
 
-// بررسی عضویت در گروه بررسی
 function checkReviewGroupMembership($user_id) {
     $result = makeHTTPRequest('getChatMember', [
         'chat_id' => REVIEW_GROUP_ID,
@@ -246,36 +307,34 @@ function showUserProfile($chat_id) {
     }
     
     $profileText = "📖 <b>پروفایل شما</b>\n\n" .
-                   "👤 <b>نام و نام خانوادگی:</b> {$userData['name']}\n" .
-                   "🏢 <b>شرکت:</b> {$userData['company']}\n" .
-                   "💼 <b>تخصص:</b> {$userData['expertise']}\n" .
-                   "📧 <b>ایمیل:</b> {$userData['email']}\n\n" .
-                   "📋 <b>انگیزه‌نامه:</b>\n{$userData['motivation']}\n\n";
+                   "👤 <b>نام و نام خانوادگی:</b> " . ($userData['name'] ?? 'ثبت نشده') . "\n" .
+                   "🏢 <b>شرکت:</b> " . ($userData['company'] ?? 'ثبت نشده') . "\n" .
+                   "💼 <b>تخصص:</b> " . ($userData['expertise'] ?? 'ثبت نشده') . "\n" .
+                   "📧 <b>ایمیل:</b> " . ($userData['email'] ?? 'ثبت نشده') . "\n\n" .
+                   "📋 <b>انگیزه‌نامه:</b>\n" . ($userData['motivation'] ?? 'ثبت نشده') . "\n\n";
 
-    if ($userData['verification_type']) {
+    if (isset($userData['verification_type'])) {
         if ($userData['verification_type'] === 'linkedin') {
-            $profileText .= "🔗 <b>لینک LinkedIn:</b>\n{$userData['verification_value']}\n";
+            $profileText .= "🔗 <b>لینک LinkedIn:</b>\n" . ($userData['verification_value'] ?? '') . "\n";
         } elseif ($userData['verification_type'] === 'resume') {
-            $profileText .= "📄 <b>لینک رزومه:</b>\n{$userData['verification_value']}\n";
+            $profileText .= "📄 <b>لینک رزومه:</b>\n" . ($userData['verification_value'] ?? '') . "\n";
         } elseif ($userData['verification_type'] === 'referral') {
-            $profileText .= "👥 <b>معرف:</b>\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
+            $profileText .= "👥 <b>معرف:</b>\n" . ($userData['verification_ref_name'] ?? '') . " (" . ($userData['verification_value'] ?? '') . ")\n";
         }
     }
     
     $status = $userData['status'] ?? 'در انتظار بررسی';
     $profileText .= "\n🔍 <b>وضعیت درخواست:</b> {$status}";
     
-    // اگر درخواست رد شده و دلیلی برای آن ثبت شده باشد
-    if ($status === 'رد شده' && $userData['rejection_reason']) {
+    if ($status === 'رد شده' && isset($userData['rejection_reason']) && $userData['rejection_reason']) {
         $profileText .= "\n<b>دلیل رد درخواست:</b> {$userData['rejection_reason']}";
         
-        // اضافه کردن اطلاعات بررسی‌کننده
-        if ($userData['reviewed_by_username']) {
+        if (isset($userData['reviewed_by_username']) && $userData['reviewed_by_username']) {
             $profileText .= "\n<b>بررسی شده توسط:</b> @{$userData['reviewed_by_username']}";
         }
-    } elseif ($status === 'تایید شده' && $userData['reviewed_by_username']) {
+    } elseif ($status === 'تایید شده' && isset($userData['reviewed_by_username']) && $userData['reviewed_by_username']) {
         $profileText .= "\n<b>تایید شده توسط:</b> @{$userData['reviewed_by_username']}";
-        if ($userData['rejection_reason']) { // در اینجا rejection_reason به عنوان دلیل تایید استفاده میشه
+        if (isset($userData['rejection_reason']) && $userData['rejection_reason']) {
             $profileText .= "\n<b>دلیل تایید:</b> {$userData['rejection_reason']}";
         }
     }
@@ -288,10 +347,153 @@ function showUserProfile($chat_id) {
     sendMessage($chat_id, $profileText, $keyboard);
 }
 
-// دریافت و پردازش پیام‌های ورودی
+function finalizeRegistration($chat_id) {
+    setUserState($chat_id, 'COMPLETED');
+    saveUserData($chat_id, 'status', 'در انتظار بررسی');
+    
+    $userData = getUserData($chat_id);
+    
+    $groupMessage = "🔍 درخواست عضویت جدید:\n\n" .
+                   "👤 نام: " . ($userData['name'] ?? '') . "\n" .
+                   "🏢 شرکت: " . ($userData['company'] ?? '') . "\n" .
+                   "💼 تخصص: " . ($userData['expertise'] ?? '') . "\n" .
+                   "📧 ایمیل: " . ($userData['email'] ?? '') . "\n\n" .
+                   "📋 انگیزه‌نامه:\n" . ($userData['motivation'] ?? '') . "\n\n";
+
+    if (isset($userData['verification_type'])) {
+        if ($userData['verification_type'] === 'linkedin') {
+            $groupMessage .= "🔗 لینک LinkedIn:\n" . ($userData['verification_value'] ?? '') . "\n";
+        } elseif ($userData['verification_type'] === 'resume') {
+            $groupMessage .= "📄 لینک رزومه:\n" . ($userData['verification_value'] ?? '') . "\n";
+        } elseif ($userData['verification_type'] === 'referral') {
+            $groupMessage .= "👥 معرف:\n" . ($userData['verification_ref_name'] ?? '') . " (" . ($userData['verification_value'] ?? '') . ")\n";
+        }
+    }
+    
+    $keyboard = [
+        [
+            ['text' => '✅ تایید درخواست', 'callback_data' => 'approve_' . $chat_id],
+            ['text' => '❌ رد درخواست', 'callback_data' => 'reject_' . $chat_id]
+        ]
+    ];
+    
+    // Send to review group with silent notification
+    sendMessage(REVIEW_GROUP_ID, $groupMessage, $keyboard, true);
+    
+    sendMessage($chat_id, 
+        "✅ اطلاعات شما با موفقیت ثبت شد.\n\n" .
+        "درخواست شما توسط تیم PC بررسی خواهد شد و پس از تأیید، لینک گروه برای شما ارسال می‌شود.\n\n" .
+        "با تشکر از عضویت شما در IRNOG 🌟");
+        
+    showUserProfile($chat_id);
+}
+
+function handleApplicationResponse($action, $user_id, $reviewer_chat_id, $message_id = null, $reason = null) {
+    $isApproved = ($action === 'approve');
+    $userData = getUserData($user_id);
+    
+    if (!$userData) {
+        sendMessage($reviewer_chat_id, "❌ خطا: اطلاعات کاربر یافت نشد.");
+        return;
+    }
+    
+    $reviewerInfo = makeHTTPRequest('getChat', ['chat_id' => $reviewer_chat_id]);
+    $reviewerUsername = '';
+    
+    if (isset($reviewerInfo['result']['username'])) {
+        $reviewerUsername = $reviewerInfo['result']['username'];
+    } elseif (isset($reviewerInfo['result']['first_name'])) {
+        $reviewerUsername = $reviewerInfo['result']['first_name'];
+    }
+    
+    $name = $userData['name'] ?? 'نامشخص';
+    
+    if ($isApproved) {
+        saveUserData($user_id, 'status', 'تایید شده');
+        saveUserData($user_id, 'rejection_reason', $reason);
+        saveUserData($user_id, 'reviewed_by_user_id', $reviewer_chat_id);
+        saveUserData($user_id, 'reviewed_by_username', $reviewerUsername);
+        saveUserData($user_id, 'review_decision', 'approved');
+        
+        // Create one-time invite link
+        $inviteLink = createOneTimeInviteLink($user_id, $name);
+        
+        if ($inviteLink) {
+            saveUserData($user_id, 'invite_link', $inviteLink);
+            
+            $userMessage = "🎉 <b>تبریک!</b>\n\n" .
+                          "درخواست عضویت شما در IRNOG تایید شد.\n\n";
+            
+            if ($reason && trim($reason) !== '' && strtolower(trim($reason)) !== 'تایید') {
+                $userMessage .= "<b>دلیل تایید:</b> {$reason}\n\n";
+            }
+            
+            $userMessage .= "برای ورود به گروه اصلی از لینک زیر استفاده کنید:\n" .
+                           "⚠️ توجه: این لینک فقط یکبار و تنها برای شما قابل استفاده است.";
+            
+            $keyboardUser = [[['text' => 'ورود به گروه', 'url' => $inviteLink]]];
+            sendMessage($user_id, $userMessage, $keyboardUser);
+            
+            sendMessage($reviewer_chat_id, "✅ درخواست {$name} با موفقیت تایید شد و لینک یکبار مصرف گروه برای ایشان ارسال گردید.");
+        } else {
+            sendMessage($reviewer_chat_id, "❌ خطا در ایجاد لینک دعوت. لطفاً مجدداً تلاش کنید.");
+            return;
+        }
+        
+        $reportMessage = "✅ <b>گزارش تایید درخواست</b>\n\n" .
+                        "👤 <b>متقاضی:</b> {$name}\n" .
+                        "👨‍💼 <b>تایید شده توسط:</b> @{$reviewerUsername}\n";
+        
+        if ($reason && trim($reason) !== '' && strtolower(trim($reason)) !== 'تایید') {
+            $reportMessage .= "📝 <b>دلیل تایید:</b> {$reason}\n";
+        }
+        
+        $reportMessage .= "\n🔗 لینک یکبار مصرف برای متقاضی ارسال شد.";
+        
+        sendMessage(REVIEW_GROUP_ID, $reportMessage, null, true);
+        
+    } else {
+        saveUserData($user_id, 'status', 'رد شده');
+        saveUserData($user_id, 'reviewed_by_user_id', $reviewer_chat_id);
+        saveUserData($user_id, 'reviewed_by_username', $reviewerUsername);
+        saveUserData($user_id, 'review_decision', 'rejected');
+        
+        if ($reason) {
+            saveUserData($user_id, 'rejection_reason', $reason);
+        }
+        
+        $userMessage = "❌ <b>اطلاعیه</b>\n\n" .
+                      "متأسفانه درخواست عضویت شما در IRNOG در این مرحله تایید نشد.";
+        
+        if ($reason) {
+            $userMessage .= "\n\n<b>دلیل:</b> {$reason}";
+        }
+        
+        $userMessage .= "\n\nشما می‌توانید پس از تکمیل اطلاعات خود، مجدداً درخواست خود را ارسال نمایید.";
+        
+        sendMessage($user_id, $userMessage);
+        
+        sendMessage($reviewer_chat_id, "❌ درخواست {$name} با موفقیت رد شد و به کاربر اطلاع داده شد.");
+        
+        $reportMessage = "❌ <b>گزارش رد درخواست</b>\n\n" .
+                        "👤 <b>متقاضی:</b> {$name}\n" .
+                        "👨‍💼 <b>رد شده توسط:</b> @{$reviewerUsername}\n";
+        
+        if ($reason) {
+            $reportMessage .= "📝 <b>دلیل رد:</b> {$reason}\n";
+        }
+        
+        $reportMessage .= "\n📢 متقاضی می‌تواند پس از اصلاح مجدداً درخواست دهد.";
+        
+        sendMessage(REVIEW_GROUP_ID, $reportMessage, null, true);
+    }
+    
+    return true;
+}
+
+// Receive and process incoming messages
 $update = json_decode(file_get_contents('php://input'), true);
 
-// ذخیره لاگ برای دیباگ
 file_put_contents('request_log.txt', date('Y-m-d H:i:s') . ': ' . print_r($update, true) . "\n", FILE_APPEND);
 
 if (isset($update['message'])) {
@@ -300,11 +502,10 @@ if (isset($update['message'])) {
     $text = $message['text'] ?? '';
     $user_id = $message['from']['id'];
     
-    // بررسی که آیا کاربر قبلا ثبت‌نام کرده است
     $existingUser = getUserData($chat_id);
     $user_state = getUserState($chat_id);
     
-    // بررسی وضعیت انتظار برای دلیل رد یا تایید درخواست
+    // Check if waiting for approval/rejection reason
     if (preg_match('/^AWAIT_(APPROVE|REJECT)_REASON_(.+)$/', $user_state, $matches)) {
         $action = strtolower($matches[1]);
         $applicant_user_id = $matches[2];
@@ -326,8 +527,7 @@ if (isset($update['message'])) {
                 return;
             }
             
-            // بررسی اینکه آیا کاربر قبلا ثبت‌نام کرده است
-            if ($existingUser && $existingUser['name']) {
+            if ($existingUser && isset($existingUser['name']) && $existingUser['name']) {
                 $name = $existingUser['name'];
                 sendMessage($chat_id, "سلام {$name} عزیز 👋\n\nخوش‌آمدید. از منوی زیر می‌توانید گزینه مورد نظر خود را انتخاب کنید:", [
                     [['text' => 'مشاهده پروفایل', 'callback_data' => 'view_profile']],
@@ -350,7 +550,7 @@ if (isset($update['message'])) {
                 case 'AWAIT_NAME':
                     saveUserData($chat_id, 'name', $text);
                     setUserState($chat_id, 'AWAIT_COMPANY_INPUT');
-                    sendMessage($chat_id, " لطفاً نام شرکت خود را وارد کنید یا در صورتی که به صورت فریلنسری فعالیت می‌کنید، عنوان «فریلنسر» را وارد نمایید:");
+                    sendMessage($chat_id, "لطفاً نام شرکت خود را وارد کنید یا در صورتی که به صورت فریلنسری فعالیت می‌کنید، عنوان «فریلنسر» را وارد نمایید:");
                     break;
                     
                 case 'AWAIT_COMPANY_INPUT':
@@ -368,8 +568,7 @@ if (isset($update['message'])) {
                 case 'AWAIT_EMAIL':
                     saveUserData($chat_id, 'email', $text);
                     setUserState($chat_id, 'AWAIT_MOTIVATION');
-                    sendMessage($chat_id, 
-                        "هدف شما از عضویت در کامیونیتی ایرناگ چیست؟\n\n" );
+                    sendMessage($chat_id, "هدف شما از عضویت در کامیونیتی ایرناگ چیست؟\n\n");
                     break;
                     
                 case 'AWAIT_MOTIVATION':
@@ -404,14 +603,12 @@ if (isset($update['message'])) {
                     break;
                     
                 case 'AWAIT_REFERRAL_NAME':
-                    // فقط نام معرف را ذخیره می‌کنیم و منتظر ID می‌مانیم
                     saveUserData($chat_id, 'verification_ref_name', $text);
                     setUserState($chat_id, 'AWAIT_REFERRAL_ID');
                     sendMessage($chat_id, "لطفاً آیدی تلگرام یا شماره تماس عضو معرف را وارد کنید:");
                     break;
                 
                 case 'AWAIT_REFERRAL_ID':
-                    // حالا هم نام و هم ID داریم، پس ذخیره می‌کنیم
                     $refName = getUserData($chat_id, 'verification_ref_name');
                     saveVerificationData($chat_id, 'referral', $text, $refName);
                     finalizeRegistration($chat_id);
@@ -459,35 +656,33 @@ if (isset($update['callback_query'])) {
     $from_user_id = $from_user['id'];
     $from_username = $from_user['username'] ?? $from_user['first_name'];
     
-    // اگر تایید یا رد درخواست عضویت است
     if (strpos($data, 'approve_') === 0) {
         $user_id = substr($data, 8);
         
-        // بررسی عضویت در گروه بررسی
         if (!checkReviewGroupMembership($from_user_id)) {
             sendMessage($from_user_id, "❌ شما مجاز به انجام این عمل نیستید.");
             return;
         }
         
-        // درخواست دلیل تایید در پیوی
         setUserState($from_user_id, 'AWAIT_APPROVE_REASON_' . $user_id);
         sendMessage($from_user_id, "لطفاً دلیل تایید درخواست را وارد کنید (اختیاری - می‌توانید فقط 'تایید' بنویسید):");
         
-        // آپدیت پیام در گروه
         $userData = getUserData($user_id);
         $updatedMessage = "🔄 <b>در حال بررسی توسط @{$from_username}</b>\n\n" .
-                         "👤 نام: {$userData['name']}\n" .
-                         "🏢 شرکت: {$userData['company']}\n" .
-                         "💼 تخصص: {$userData['expertise']}\n" .
-                         "📧 ایمیل: {$userData['email']}\n\n" .
-                         "📋 انگیزه‌نامه:\n{$userData['motivation']}\n\n";
+                         "👤 نام: " . ($userData['name'] ?? '') . "\n" .
+                         "🏢 شرکت: " . ($userData['company'] ?? '') . "\n" .
+                         "💼 تخصص: " . ($userData['expertise'] ?? '') . "\n" .
+                         "📧 ایمیل: " . ($userData['email'] ?? '') . "\n\n" .
+                         "📋 انگیزه‌نامه:\n" . ($userData['motivation'] ?? '') . "\n\n";
         
-        if ($userData['verification_type'] === 'linkedin') {
-            $updatedMessage .= "🔗 لینک LinkedIn:\n{$userData['verification_value']}\n";
-        } elseif ($userData['verification_type'] === 'resume') {
-            $updatedMessage .= "📄 لینک رزومه:\n{$userData['verification_value']}\n";
-        } elseif ($userData['verification_type'] === 'referral') {
-            $updatedMessage .= "👥 معرف:\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
+        if (isset($userData['verification_type'])) {
+            if ($userData['verification_type'] === 'linkedin') {
+                $updatedMessage .= "🔗 لینک LinkedIn:\n" . ($userData['verification_value'] ?? '') . "\n";
+            } elseif ($userData['verification_type'] === 'resume') {
+                $updatedMessage .= "📄 لینک رزومه:\n" . ($userData['verification_value'] ?? '') . "\n";
+            } elseif ($userData['verification_type'] === 'referral') {
+                $updatedMessage .= "👥 معرف:\n" . ($userData['verification_ref_name'] ?? '') . " (" . ($userData['verification_value'] ?? '') . ")\n";
+            }
         }
         
         editMessageText($chat_id, $message_id, $updatedMessage);
@@ -496,31 +691,30 @@ if (isset($update['callback_query'])) {
     } elseif (strpos($data, 'reject_') === 0 && strpos($data, 'reject_reason_') !== 0) {
         $user_id = substr($data, 7);
         
-        // بررسی عضویت در گروه بررسی
         if (!checkReviewGroupMembership($from_user_id)) {
             sendMessage($from_user_id, "❌ شما مجاز به انجام این عمل نیستید.");
             return;
         }
         
-        // درخواست دلیل رد در پیوی
         setUserState($from_user_id, 'AWAIT_REJECT_REASON_' . $user_id);
         sendMessage($from_user_id, "لطفاً دلیل رد درخواست کاربر را وارد کنید:");
         
-        // آپدیت پیام در گروه
         $userData = getUserData($user_id);
         $updatedMessage = "🔄 <b>در حال بررسی توسط @{$from_username}</b>\n\n" .
-                         "👤 نام: {$userData['name']}\n" .
-                         "🏢 شرکت: {$userData['company']}\n" .
-                         "💼 تخصص: {$userData['expertise']}\n" .
-                         "📧 ایمیل: {$userData['email']}\n\n" .
-                         "📋 انگیزه‌نامه:\n{$userData['motivation']}\n\n";
+                         "👤 نام: " . ($userData['name'] ?? '') . "\n" .
+                         "🏢 شرکت: " . ($userData['company'] ?? '') . "\n" .
+                         "💼 تخصص: " . ($userData['expertise'] ?? '') . "\n" .
+                         "📧 ایمیل: " . ($userData['email'] ?? '') . "\n\n" .
+                         "📋 انگیزه‌نامه:\n" . ($userData['motivation'] ?? '') . "\n\n";
         
-        if ($userData['verification_type'] === 'linkedin') {
-            $updatedMessage .= "🔗 لینک LinkedIn:\n{$userData['verification_value']}\n";
-        } elseif ($userData['verification_type'] === 'resume') {
-            $updatedMessage .= "📄 لینک رزومه:\n{$userData['verification_value']}\n";
-        } elseif ($userData['verification_type'] === 'referral') {
-            $updatedMessage .= "👥 معرف:\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
+        if (isset($userData['verification_type'])) {
+            if ($userData['verification_type'] === 'linkedin') {
+                $updatedMessage .= "🔗 لینک LinkedIn:\n" . ($userData['verification_value'] ?? '') . "\n";
+            } elseif ($userData['verification_type'] === 'resume') {
+                $updatedMessage .= "📄 لینک رزومه:\n" . ($userData['verification_value'] ?? '') . "\n";
+            } elseif ($userData['verification_type'] === 'referral') {
+                $updatedMessage .= "👥 معرف:\n" . ($userData['verification_ref_name'] ?? '') . " (" . ($userData['verification_value'] ?? '') . ")\n";
+            }
         }
         
         editMessageText($chat_id, $message_id, $updatedMessage);
@@ -585,9 +779,9 @@ if (isset($update['callback_query'])) {
             setUserState($chat_id, 'EDIT_MOTIVATION');
             sendMessage($chat_id, 
                 "لطفاً انگیزه‌نامه جدید خود را با پاسخ به سوالات زیر بنویسید:\n\n" .
-                "1. چه تجربیاتی در زمینه مدیریت و توسعه شبکه‌های اینترنتی دارید؟\n" .
-                "2. چگونه می‌توانید به بهبود شرایط استفاده از اینترنت در ایران کمک کنید؟\n" .
-                "3. دیدگاه شما درباره چالش‌های فعلی اینترنت ایران و راهکارهای پیشنهادی چیست؟\n" .
+                "1. چه تجربیاتی در زمینه مدیریت و توسعه شبکه‌های اینترنتی دارید?\n" .
+                "2. چگونه می‌توانید به بهبود شرایط استفاده از اینترنت در ایران کمک کنید?\n" .
+                "3. دیدگاه شما درباره چالش‌های فعلی اینترنت ایران و راهکارهای پیشنهادی چیست?\n" .
                 "4. چگونه می‌توانید در فعالیت‌های مشورتی و راهبردی IRNOG مشارکت کنید?");
             break;
             
@@ -615,23 +809,23 @@ if (isset($update['callback_query'])) {
             saveUserData($chat_id, 'reviewed_by_username', null);
             saveUserData($chat_id, 'review_decision', null);
             
-            // آماده‌سازی پیام برای گروه بررسی
             $groupMessage = "🔍 درخواست عضویت مجدد:\n\n" .
-                           "👤 نام: {$userData['name']}\n" .
-                           "🏢 شرکت: {$userData['company']}\n" .
-                           "💼 تخصص: {$userData['expertise']}\n" .
-                           "📧 ایمیل: {$userData['email']}\n\n" .
-                           "📋 انگیزه‌نامه:\n{$userData['motivation']}\n\n";
+                           "👤 نام: " . ($userData['name'] ?? '') . "\n" .
+                           "🏢 شرکت: " . ($userData['company'] ?? '') . "\n" .
+                           "💼 تخصص: " . ($userData['expertise'] ?? '') . "\n" .
+                           "📧 ایمیل: " . ($userData['email'] ?? '') . "\n\n" .
+                           "📋 انگیزه‌نامه:\n" . ($userData['motivation'] ?? '') . "\n\n";
 
-            if ($userData['verification_type'] === 'linkedin') {
-                $groupMessage .= "🔗 لینک LinkedIn:\n{$userData['verification_value']}\n";
-            } elseif ($userData['verification_type'] === 'resume') {
-                $groupMessage .= "📄 لینک رزومه:\n{$userData['verification_value']}\n";
-            } elseif ($userData['verification_type'] === 'referral') {
-                $groupMessage .= "👥 معرف:\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
+            if (isset($userData['verification_type'])) {
+                if ($userData['verification_type'] === 'linkedin') {
+                    $groupMessage .= "🔗 لینک LinkedIn:\n" . ($userData['verification_value'] ?? '') . "\n";
+                } elseif ($userData['verification_type'] === 'resume') {
+                    $groupMessage .= "📄 لینک رزومه:\n" . ($userData['verification_value'] ?? '') . "\n";
+                } elseif ($userData['verification_type'] === 'referral') {
+                    $groupMessage .= "👥 معرف:\n" . ($userData['verification_ref_name'] ?? '') . " (" . ($userData['verification_value'] ?? '') . ")\n";
+                }
             }
             
-            // اضافه کردن دکمه‌های تایید و رد برای گروه
             $keyboard = [
                 [
                     ['text' => '✅ تایید درخواست', 'callback_data' => 'approve_' . $chat_id],
@@ -639,177 +833,12 @@ if (isset($update['callback_query'])) {
                 ]
             ];
             
-            // ارسال به گروه بررسی
-            sendMessage(REVIEW_GROUP_ID, $groupMessage, $keyboard);
+            // Send to review group with silent notification
+            sendMessage(REVIEW_GROUP_ID, $groupMessage, $keyboard, true);
             
             sendMessage($chat_id, "✅ درخواست شما مجددا برای بررسی ارسال شد. نتیجه بررسی به شما اطلاع داده خواهد شد.");
             break;
     }
 }
 
-function finalizeRegistration($chat_id) {
-    setUserState($chat_id, 'COMPLETED');
-    saveUserData($chat_id, 'status', 'در انتظار بررسی');
-    
-    // دریافت اطلاعات کاربر
-    $userData = getUserData($chat_id);
-    
-    // آماده‌سازی پیام برای گروه بررسی
-    $groupMessage = "🔍 درخواست عضویت جدید:\n\n" .
-                   "👤 نام: {$userData['name']}\n" .
-                   "🏢 شرکت: {$userData['company']}\n" .
-                   "💼 تخصص: {$userData['expertise']}\n" .
-                   "📧 ایمیل: {$userData['email']}\n\n" .
-                   "📋 انگیزه‌نامه:\n{$userData['motivation']}\n\n";
-
-    if ($userData['verification_type'] === 'linkedin') {
-        $groupMessage .= "🔗 لینک LinkedIn:\n{$userData['verification_value']}\n";
-    } elseif ($userData['verification_type'] === 'resume') {
-        $groupMessage .= "📄 لینک رزومه:\n{$userData['verification_value']}\n";
-    } elseif ($userData['verification_type'] === 'referral') {
-        $groupMessage .= "👥 معرف:\n{$userData['verification_ref_name']} ({$userData['verification_value']})\n";
-    }
-    
-    // اضافه کردن دکمه‌های تایید و رد برای گروه
-    $keyboard = [
-        [
-            ['text' => '✅ تایید درخواست', 'callback_data' => 'approve_' . $chat_id],
-            ['text' => '❌ رد درخواست', 'callback_data' => 'reject_' . $chat_id]
-        ]
-    ];
-    
-    // ارسال به گروه بررسی
-    $groupResult = sendMessage(REVIEW_GROUP_ID, $groupMessage, $keyboard);
-    
-    // لاگ نتیجه ارسال برای دیباگ
-    file_put_contents('group_message_log.txt', date('Y-m-d H:i:s') . ': ' . print_r($groupResult, true) . "\n", FILE_APPEND);
-    
-    // ارسال پیام تأیید به کاربر و نمایش پروفایل
-    sendMessage($chat_id, 
-        "✅ اطلاعات شما با موفقیت ثبت شد.\n\n" .
-        "درخواست شما توسط تیم PC بررسی خواهد شد و پس از تأیید، لینک گروه برای شما ارسال می‌شود.\n\n" .
-        "با تشکر از عضویت شما در IRNOG 🌟");
-        
-    // نمایش پروفایل کاربر
-    showUserProfile($chat_id);
-}
-
-/**
- * تابع پردازش پاسخ اعضای گروه به درخواست‌های عضویت
- */
-function handleApplicationResponse($action, $user_id, $reviewer_chat_id, $message_id = null, $reason = null) {
-    // ثبت لاگ برای دیباگ
-    file_put_contents('debug_actions_log.txt', date('Y-m-d H:i:s') . ': action=' . $action . ', user_id=' . $user_id . ', reviewer=' . $reviewer_chat_id . "\n", FILE_APPEND);
-    
-    $isApproved = ($action === 'approve');
-    $userData = getUserData($user_id);
-    
-    if (!$userData) {
-        sendMessage($reviewer_chat_id, "❌ خطا: اطلاعات کاربر یافت نشد.");
-        return;
-    }
-    
-    // دریافت اطلاعات بررسی‌کننده
-    $reviewerInfo = makeHTTPRequest('getChat', ['chat_id' => $reviewer_chat_id]);
-    $reviewerUsername = '';
-    
-    if (isset($reviewerInfo['result']['username'])) {
-        $reviewerUsername = $reviewerInfo['result']['username'];
-    } elseif (isset($reviewerInfo['result']['first_name'])) {
-        $reviewerUsername = $reviewerInfo['result']['first_name'];
-    }
-    
-    $name = $userData['name'];
-    
-    if ($isApproved) {
-        // Approve request
-        saveUserData($user_id, 'status', 'تایید شده');
-        saveUserData($user_id, 'rejection_reason', $reason); // در اینجا به عنوان دلیل تایید استفاده میشه
-        saveUserData($user_id, 'reviewed_by_user_id', $reviewer_chat_id);
-        saveUserData($user_id, 'reviewed_by_username', $reviewerUsername);
-        saveUserData($user_id, 'review_decision', 'approved');
-        
-        // Send message to user
-        $userMessage = "🎉 <b>تبریک!</b>\n\n" .
-                      "درخواست عضویت شما در IRNOG تایید شد.\n\n";
-        
-        if ($reason && trim($reason) !== '' && strtolower(trim($reason)) !== 'تایید') {
-            $userMessage .= "<b>دلیل تایید:</b> {$reason}\n\n";
-        }
-        
-        $userMessage .= "برای ورود به گروه اصلی می‌توانید از لینک زیر استفاده کنید:\n" . GROUP_LINK;
-        
-        $keyboardUser = [[['text' => 'ورود به گروه', 'url' => GROUP_LINK]]];
-        sendMessage($user_id, $userMessage, $keyboardUser);
-        
-        // Send confirmation to reviewer
-        sendMessage($reviewer_chat_id, "✅ درخواست {$name} با موفقیت تایید شد و لینک گروه برای ایشان ارسال گردید.");
-        
-        // Send report to review group
-        $reportMessage = "✅ <b>گزارش تایید درخواست</b>\n\n" .
-                        "👤 <b>متقاضی:</b> {$name}\n" .
-                        "👨‍💼 <b>تایید شده توسط:</b> @{$reviewerUsername}\n";
-        
-        if ($reason && trim($reason) !== '' && strtolower(trim($reason)) !== 'تایید') {
-            $reportMessage .= "📝 <b>دلیل تایید:</b> {$reason}\n";
-        }
-        
-        $reportMessage .= "\n🔗 لینک گروه برای متقاضی ارسال شد.";
-        
-        sendMessage(REVIEW_GROUP_ID, $reportMessage);
-        
-    } else {
-        // Reject request
-        saveUserData($user_id, 'status', 'رد شده');
-        saveUserData($user_id, 'reviewed_by_user_id', $reviewer_chat_id);
-        saveUserData($user_id, 'reviewed_by_username', $reviewerUsername);
-        saveUserData($user_id, 'review_decision', 'rejected');
-        
-        // Save rejection reason if provided
-        if ($reason) {
-            saveUserData($user_id, 'rejection_reason', $reason);
-        }
-        
-        // Send message to user
-        $userMessage = "❌ <b>اطلاعیه</b>\n\n" .
-                      "متأسفانه درخواست عضویت شما در IRNOG در این مرحله تایید نشد.";
-        
-        // Add rejection reason if provided
-        if ($reason) {
-            $userMessage .= "\n\n<b>دلیل:</b> {$reason}";
-        }
-        
-        $userMessage .= "\n\nشما می‌توانید پس از تکمیل اطلاعات خود، مجدداً درخواست خود را ارسال نمایید.";
-        
-        sendMessage($user_id, $userMessage);
-        
-        // Send confirmation to reviewer
-        sendMessage($reviewer_chat_id, "❌ درخواست {$name} با موفقیت رد شد و به کاربر اطلاع داده شد.");
-        
-        // Send report to review group
-        $reportMessage = "❌ <b>گزارش رد درخواست</b>\n\n" .
-                        "👤 <b>متقاضی:</b> {$name}\n" .
-                        "👨‍💼 <b>رد شده توسط:</b> @{$reviewerUsername}\n";
-        
-        if ($reason) {
-            $reportMessage .= "📝 <b>دلیل رد:</b> {$reason}\n";
-        }
-        
-        $reportMessage .= "\n📢 متقاضی می‌تواند پس از اصلاح مجدداً درخواست دهد.";
-        
-        sendMessage(REVIEW_GROUP_ID, $reportMessage);
-    }
-    
-    // Log for debugging
-    $logEntry = date('Y-m-d H:i:s') . ': درخواست ' . $user_id . ' (' . $name . ') ' . 
-               ($isApproved ? 'تایید' : 'رد') . ' شده توسط ' . $reviewerUsername;
-    
-    if ($reason) {
-        $logEntry .= " با دلیل: " . $reason;
-    }
-    
-    $logEntry .= "\n";
-    file_put_contents('group_review_actions_log.txt', $logEntry, FILE_APPEND);
-    
-    return true;
-}
+?>
