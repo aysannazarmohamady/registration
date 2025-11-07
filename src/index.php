@@ -224,6 +224,10 @@ function makeHTTPRequest($method, $params = []) {
 }
 
 function sendMessage($chat_id, $text, $keyboard = null, $silent = false) {
+    if ($chat_id == MAIN_GROUP_ID) {
+        return;
+    }
+    
     $params = [
         'chat_id' => $chat_id,
         'text' => $text,
@@ -240,6 +244,7 @@ function sendMessage($chat_id, $text, $keyboard = null, $silent = false) {
     
     return makeHTTPRequest('sendMessage', $params);
 }
+
 
 function editMessageText($chat_id, $message_id, $text, $keyboard = null) {
     $params = [
@@ -353,8 +358,18 @@ function finalizeRegistration($chat_id) {
     
     $userData = getUserData($chat_id);
     
+    // Get user info to extract username
+    $userInfo = makeHTTPRequest('getChat', ['chat_id' => $chat_id]);
+    $username = '';
+    if (isset($userInfo['result']['username'])) {
+        $username = '@' . $userInfo['result']['username'];
+    } elseif (isset($userInfo['result']['first_name'])) {
+        $username = $userInfo['result']['first_name'];
+    }
+    
     $groupMessage = "🔍 درخواست عضویت جدید:\n\n" .
                    "👤 نام: " . ($userData['name'] ?? '') . "\n" .
+                   "📱 آیدی تلگرام: " . $username . "\n" .
                    "🏢 شرکت: " . ($userData['company'] ?? '') . "\n" .
                    "💼 تخصص: " . ($userData['expertise'] ?? '') . "\n" .
                    "📧 ایمیل: " . ($userData['email'] ?? '') . "\n\n" .
@@ -809,8 +824,18 @@ if (isset($update['callback_query'])) {
             saveUserData($chat_id, 'reviewed_by_username', null);
             saveUserData($chat_id, 'review_decision', null);
             
+            // Get user info to extract username
+            $userInfo = makeHTTPRequest('getChat', ['chat_id' => $chat_id]);
+            $username = '';
+            if (isset($userInfo['result']['username'])) {
+                $username = '@' . $userInfo['result']['username'];
+            } elseif (isset($userInfo['result']['first_name'])) {
+                $username = $userInfo['result']['first_name'];
+            }
+            
             $groupMessage = "🔍 درخواست عضویت مجدد:\n\n" .
                            "👤 نام: " . ($userData['name'] ?? '') . "\n" .
+                           "📱 آیدی تلگرام: " . $username . "\n" .
                            "🏢 شرکت: " . ($userData['company'] ?? '') . "\n" .
                            "💼 تخصص: " . ($userData['expertise'] ?? '') . "\n" .
                            "📧 ایمیل: " . ($userData['email'] ?? '') . "\n\n" .
